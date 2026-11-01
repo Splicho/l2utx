@@ -1,0 +1,9 @@
+# Normalise text files to LF in the repository, keep binaries untouched.
+* text=auto eol=lf
+
+*.png binary
+*.utx binary
+*.dds binary
+*.exe binary
+*.u binary
+*.ukx binary

@@ -1,0 +1,12 @@
+# build output — the binary ships through GitHub Releases, not the tree
+*.exe
+*.tmp
+
+# extracted texture folders and package backups
+*.textures/
+*.bak
+
+# Go build caches
+.gocache/
+.gotmp/
+.gopath/
