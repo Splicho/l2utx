@@ -52,6 +52,43 @@ type Params struct {
 	Saturation float64
 	Lightness  float64
 	Mode       Mode
+
+	// HueFrom and HueTo restrict the adjustment to pixels whose original hue lies
+	// in [HueFrom, HueTo) degrees. Both zero means "every pixel". The window may
+	// wrap around 0, so 320 to 40 selects magenta through orange.
+	HueFrom float64
+	HueTo   float64
+	// SatMin is the lowest HSV saturation (0..1) a pixel must have to be touched.
+	// Armour shading and grey metal sit below it and stay bit-identical.
+	SatMin float64
+}
+
+// HasWindow reports whether a source hue window is configured.
+func (p Params) HasWindow() bool {
+	return math.Abs(p.HueFrom) > 1e-9 || math.Abs(p.HueTo) > 1e-9
+}
+
+// matches reports whether a source colour falls inside the configured window. It
+// is what keeps a "rotate the purple parts" job from repainting gold trim, dark
+// shading or the specular maps.
+func (p Params) matches(c dxt.RGBA) bool {
+	if !p.HasWindow() && p.SatMin <= 0 {
+		return true
+	}
+	h, s := hsvOf(c)
+	if p.SatMin > 0 && s < p.SatMin {
+		return false
+	}
+	if !p.HasWindow() {
+		return true
+	}
+	from := math.Mod(p.HueFrom, 360)
+	to := math.Mod(p.HueTo, 360)
+	deg := h * 360
+	if from <= to {
+		return deg >= from && deg < to
+	}
+	return deg >= from || deg < to
 }
 
 // IsIdentity reports whether the adjustment would leave every pixel unchanged.
@@ -75,6 +112,12 @@ func (p Params) Describe() string {
 	}
 	if p.Mode == ModeHSL {
 		parts = append(parts, "HSL")
+	}
+	if p.HasWindow() {
+		parts = append(parts, fmt.Sprintf("only %g°-%g°", math.Mod(p.HueFrom, 360), math.Mod(p.HueTo, 360)))
+	}
+	if p.SatMin > 0 {
+		parts = append(parts, fmt.Sprintf("sat ≥ %g%%", math.Round(p.SatMin*1000)/10))
 	}
 	if len(parts) == 0 {
 		return "no change"
@@ -118,6 +161,9 @@ func applyHSL(img *dxt.Image, p Params) {
 	hue := p.Hue / 360
 	for i := range img.Pix {
 		c := &img.Pix[i]
+		if !p.matches(*c) {
+			continue
+		}
 		h, s, l := rgbToHSL(float64(c.R)/255, float64(c.G)/255, float64(c.B)/255)
 		h = math.Mod(h+hue, 1)
 		if h < 0 {
@@ -212,6 +258,9 @@ func applyOKLCH(img *dxt.Image, p Params) {
 	light := p.Lightness
 	for i := range img.Pix {
 		c := &img.Pix[i]
+		if !p.matches(*c) {
+			continue
+		}
 		rl, gl, bl := srgbToLinear[c.R], srgbToLinear[c.G], srgbToLinear[c.B]
 		l := 0.4122214708*rl + 0.5363325363*gl + 0.0514459929*bl
 		m := 0.2119034982*rl + 0.6806995451*gl + 0.1073969566*bl
@@ -324,6 +373,36 @@ var srgbLUT = func() (tab [4097]float64) {
 }()
 
 // --- helpers ---------------------------------------------------------------
+
+// hsvOf returns the hue (0..1) and HSV saturation (0..1) of a colour.
+func hsvOf(c dxt.RGBA) (h, s float64) {
+	r := float64(c.R) / 255
+	g := float64(c.G) / 255
+	b := float64(c.B) / 255
+	max := math.Max(r, math.Max(g, b))
+	min := math.Min(r, math.Min(g, b))
+	if max <= 0 {
+		return 0, 0
+	}
+	d := max - min
+	s = d / max
+	if d == 0 {
+		return 0, s
+	}
+	switch max {
+	case r:
+		h = math.Mod((g-b)/d, 6)
+	case g:
+		h = (b-r)/d + 2
+	default:
+		h = (r-g)/d + 4
+	}
+	h /= 6
+	if h < 0 {
+		h++
+	}
+	return h, s
+}
 
 func clamp01(v float64) float64 {
 	if v < 0 {

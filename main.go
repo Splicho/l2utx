@@ -53,6 +53,9 @@ type options struct {
 	help         bool
 	version      bool
 	hue          float64
+	hueFrom      float64
+	hueTo        float64
+	satMin       float64
 	saturation   float64
 	lightness    float64
 	mode         recolor.Mode
@@ -99,6 +102,9 @@ func (o *options) params() (recolor.Params, bool) {
 		Saturation: o.saturation,
 		Lightness:  o.lightness,
 		Mode:       o.mode,
+		HueFrom:    o.hueFrom,
+		HueTo:      o.hueTo,
+		SatMin:     o.satMin,
 	}
 	return p, !p.IsIdentity()
 }
@@ -160,6 +166,25 @@ func parseArgs(args []string) (*options, error) {
 				return nil, err
 			}
 			o.hue = v
+		case a == "-hue-range" || a == "--hue-range":
+			s, err := nextArg(args, &i, "-hue-range")
+			if err != nil {
+				return nil, err
+			}
+			from, to, err := parseHueRange(s)
+			if err != nil {
+				return nil, err
+			}
+			o.hueFrom, o.hueTo = from, to
+		case a == "-sat-min" || a == "--sat-min":
+			v, err := floatArg(args, &i, "-sat-min")
+			if err != nil {
+				return nil, err
+			}
+			if v < 0 || v > 100 {
+				return nil, errors.New("-sat-min must be between 0 and 100 (percent)")
+			}
+			o.satMin = v / 100
 		case a == "-sat" || a == "-saturation" || a == "--saturation":
 			v, err := floatArg(args, &i, "-sat")
 			if err != nil {
@@ -314,6 +339,23 @@ func floatArg(args []string, i *int, name string) (float64, error) {
 		return 0, fmt.Errorf("%s: %q is not a number", name, s)
 	}
 	return v, nil
+}
+
+// parseHueRange parses "from-to" degrees, e.g. 210-285 or 320-40 (wrapping).
+func parseHueRange(s string) (from, to float64, err error) {
+	parts := strings.SplitN(strings.TrimSpace(s), "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("-hue-range: %q is not from-to, e.g. 210-285", s)
+	}
+	from, err = strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("-hue-range: %q is not a number", parts[0])
+	}
+	to, err = strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("-hue-range: %q is not a number", parts[1])
+	}
+	return math.Mod(from, 360), math.Mod(to, 360), nil
 }
 
 func parseFormat(s string) (int, error) {
@@ -903,12 +945,16 @@ func usage() {
 	fmt.Println("   -sat PCT                 saturation scale (100 = unchanged)")
 	fmt.Println("   -light PCT               lightness scale (100 = unchanged)")
 	fmt.Println("   -mode oklch|hsl          colour model (default oklch; hsl matches Photoshop)")
+	fmt.Println("   -hue-range FROM-TO       only touch pixels whose ORIGINAL hue is in this window")
+	fmt.Println("   -sat-min PCT             ...and whose saturation is at least this much")
 	fmt.Println("   -recolor                 recolour the PNGs of an exported folder")
 	fmt.Println("   -apply                   recolour a package in place (or write -o file.utx)")
 	fmt.Println()
 	fmt.Println("   l2utx -hue 120 file.utx          extract to file.hue120.textures\\ already recoloured")
 	fmt.Println("   l2utx -hue 120 -recolor folder   write folder.hue120.textures\\ from an existing export")
 	fmt.Println("   l2utx -hue 120 -apply file.utx   rewrite the package (file.utx.bak is kept)")
+	fmt.Println("   l2utx -hue 120 -hue-range 210-285 -sat-min 18 -recolor folder")
+	fmt.Println("        turns only the violet parts, leaving gold trim, greys and blacks alone")
 	fmt.Println()
 	fmt.Println(bold("How importing works:"))
 	fmt.Println("   The name of the image selects the texture object: armor_t1004_b_i00.png")

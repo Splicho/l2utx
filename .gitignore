@@ -10,3 +10,10 @@
 .gocache/
 .gotmp/
 .gopath/
+
+# working folders from the armour recolour
+_orig/
+_check/
+_broken_hue120/
+*.only_purple.textures/
+*.fixed.textures/

@@ -70,6 +70,8 @@ Drop that folder back onto the exe to import it. See
 -sat PCT                    saturation scale, 100 = unchanged
 -light PCT                  lightness scale, 100 = unchanged
 -mode oklch|hsl             colour model for -hue (default oklch)
+-hue-range FROM-TO          only touch pixels whose ORIGINAL hue is in this window
+-sat-min PCT                ...and whose saturation is at least this much
 -recolor                    recolour the PNGs of an exported folder
 -apply                      recolour a package in place
 -nobackup                   do not create <file>.utx.bak
@@ -149,8 +151,32 @@ alone. DXT1, DXT3, DXT5 and RGBA8 are re-encoded.
 Because the rotation applies to every coloured pixel, a texture that mixes skin
 with clothing will rotate the skin too. To keep skin or other details, recolour
 only the files you want, or make a variant folder and remove the unwanted PNGs
-before dropping it. A hue-range selector would be the natural next step if that
-is not enough.
+before dropping it, or use the hue window below.
+
+### Recolouring only part of a texture
+
+`-hue-range FROM-TO` restricts the rotation to pixels whose original hue lies in
+that window, and `-sat-min PCT` adds a saturation floor. Everything else is
+copied bit for bit.
+
+```
+l2utx -hue 120 -hue-range 210-285 -sat-min 18 -recolor IntactR.textures
+```
+
+That turns the violet parts of the armour (hue ≈ 245°) by 120° and leaves the
+gold trim (≈ 30°), the grey metal and the black shading alone. Without the window
+the same command rotates the trim as well, which is how gold shoulders turn
+teal.
+
+* The window is measured in degrees on the usual colour wheel: 0 red, 30 orange,
+  60 yellow, 120 green, 180 cyan, 240 blue, 270 violet, 300 magenta.
+* It may wrap around 0, so `-hue-range 320-40` selects magenta through orange.
+* `-sat-min` is what keeps the near-neutral shading out of the mask; 15-25% is a
+  good starting point for armour, 40%+ for saturated cloth.
+* Both are also honoured by `-apply` and by the recolour during extraction.
+
+Typical windows: violet/blue armour body 210-285, red 340-25, green 90-150,
+gold 20-55.
 
 ---
 
