@@ -3,18 +3,21 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"l2utx/internal/imgio"
 	"l2utx/internal/l2tx"
+	"l2utx/internal/recolor"
 	"l2utx/internal/upkg"
 	"l2utx/internal/win"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 var (
 	useColor = false
@@ -36,19 +39,26 @@ func main() {
 }
 
 type options struct {
-	list      bool
-	importTo  string
-	images    []string
-	utx       []string
-	outDir    string
-	writePNG  bool
-	writeDDS  bool
-	forceFmt  int
-	noMips    bool
-	overwrite bool
-	noBackup  bool
-	help      bool
-	version   bool
+	list         bool
+	importTo     string
+	images       []string
+	utx          []string
+	outDir       string
+	writePNG     bool
+	writeDDS     bool
+	forceFmt     int
+	noMips       bool
+	overwrite    bool
+	noBackup     bool
+	help         bool
+	version      bool
+	hue          float64
+	saturation   float64
+	lightness    float64
+	mode         recolor.Mode
+	recolorDir   string
+	recolorOnly  bool
+	applyPackage bool
 }
 
 func run(args []string) int {
@@ -66,6 +76,12 @@ func run(args []string) int {
 		usage()
 		return 0
 	}
+	if opts.applyPackage {
+		return cmdApply(opts)
+	}
+	if opts.recolorOnly {
+		return cmdRecolor(opts)
+	}
 	if len(opts.utx) == 0 && len(opts.images) == 0 && opts.importTo == "" {
 		usage()
 		return 0
@@ -76,8 +92,19 @@ func run(args []string) int {
 	return cmdMain(opts)
 }
 
+// params returns the colour adjustment and whether it would change anything.
+func (o *options) params() (recolor.Params, bool) {
+	p := recolor.Params{
+		Hue:        o.hue,
+		Saturation: o.saturation,
+		Lightness:  o.lightness,
+		Mode:       o.mode,
+	}
+	return p, !p.IsIdentity()
+}
+
 func parseArgs(args []string) (*options, error) {
-	o := &options{forceFmt: -1}
+	o := &options{forceFmt: -1, saturation: 1, lightness: 1}
 	positional := make([]string, 0, len(args))
 	i := 0
 	for i < len(args) {
@@ -97,7 +124,7 @@ func parseArgs(args []string) (*options, error) {
 			o.importTo = args[i]
 		case a == "-o" || a == "-out" || a == "--out":
 			if i+1 >= len(args) {
-				return nil, errors.New("-o needs a folder")
+				return nil, errors.New("-o needs a folder or file")
 			}
 			i++
 			o.outDir = args[i]
@@ -127,6 +154,44 @@ func parseArgs(args []string) (*options, error) {
 				return nil, err
 			}
 			o.forceFmt = f
+		case a == "-hue" || a == "--hue":
+			v, err := floatArg(args, &i, "-hue")
+			if err != nil {
+				return nil, err
+			}
+			o.hue = v
+		case a == "-sat" || a == "-saturation" || a == "--saturation":
+			v, err := floatArg(args, &i, "-sat")
+			if err != nil {
+				return nil, err
+			}
+			if v < 0 || v > 1000 {
+				return nil, errors.New("-sat must be between 0 and 1000 (percent)")
+			}
+			o.saturation = v / 100
+		case a == "-light" || a == "-lightness" || a == "--lightness":
+			v, err := floatArg(args, &i, "-light")
+			if err != nil {
+				return nil, err
+			}
+			if v < 0 || v > 1000 {
+				return nil, errors.New("-light must be between 0 and 1000 (percent)")
+			}
+			o.lightness = v / 100
+		case a == "-mode" || a == "-hue-mode" || a == "-colorspace":
+			s, err := nextArg(args, &i, "-mode")
+			if err != nil {
+				return nil, err
+			}
+			m, ok := recolor.ParseMode(s)
+			if !ok {
+				return nil, fmt.Errorf("unknown mode %q (use oklch or hsl)", s)
+			}
+			o.mode = m
+		case a == "-recolor":
+			o.recolorOnly = true
+		case a == "-apply":
+			o.applyPackage = true
 		case strings.HasPrefix(a, "-"):
 			return nil, fmt.Errorf("unknown option %q", a)
 		default:
@@ -134,6 +199,55 @@ func parseArgs(args []string) (*options, error) {
 		}
 		i++
 	}
+
+	if o.applyPackage && o.recolorOnly {
+		return nil, errors.New("-apply and -recolor are mutually exclusive")
+	}
+	if o.applyPackage || o.recolorOnly {
+		if o.list {
+			return nil, errors.New("-list cannot be combined with -apply or -recolor")
+		}
+		if o.importTo != "" {
+			return nil, errors.New("-i cannot be combined with -apply or -recolor")
+		}
+		if _, ok := o.params(); !ok {
+			return nil, errors.New("-apply and -recolor need -hue, -sat or -light")
+		}
+	}
+	if o.recolorOnly {
+		if len(positional) != 1 {
+			return nil, errors.New("-recolor needs one exported texture folder")
+		}
+		st, err := os.Stat(positional[0])
+		if err != nil {
+			return nil, fmt.Errorf("cannot open %q: %w", positional[0], err)
+		}
+		if !st.IsDir() {
+			return nil, errors.New("-recolor takes an exported texture folder, not a file")
+		}
+		o.recolorDir = positional[0]
+		return o, nil
+	}
+	if o.applyPackage {
+		if len(positional) != 1 {
+			return nil, errors.New("-apply needs one .utx file")
+		}
+		st, err := os.Stat(positional[0])
+		if err != nil {
+			return nil, fmt.Errorf("cannot open %q: %w", positional[0], err)
+		}
+		if st.IsDir() {
+			return nil, errors.New("-apply takes one .utx file, not a folder")
+		}
+		switch strings.ToLower(filepath.Ext(positional[0])) {
+		case ".utx", ".u":
+			o.utx = append(o.utx, positional[0])
+		default:
+			return nil, fmt.Errorf("%s: not a texture package", positional[0])
+		}
+		return o, nil
+	}
+
 	// Split positionals into packages, images and folders.
 	for _, p := range positional {
 		st, err := os.Stat(p)
@@ -176,7 +290,30 @@ func parseArgs(args []string) (*options, error) {
 	if o.importTo != "" && len(o.utx) > 0 {
 		return nil, errors.New("give either a package to import into or packages to extract, not both")
 	}
+	if _, ok := o.params(); ok && (o.importTo != "" || len(o.images) > 0) {
+		return nil, errors.New("-hue, -sat and -light apply when extracting a package; use -recolor for existing images")
+	}
 	return o, nil
+}
+
+func nextArg(args []string, i *int, name string) (string, error) {
+	if *i+1 >= len(args) {
+		return "", fmt.Errorf("%s needs a value", name)
+	}
+	*i = *i + 1
+	return args[*i], nil
+}
+
+func floatArg(args []string, i *int, name string) (float64, error) {
+	s, err := nextArg(args, i, name)
+	if err != nil {
+		return 0, err
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("%s: %q is not a number", name, s)
+	}
+	return v, nil
 }
 
 func parseFormat(s string) (int, error) {
@@ -238,11 +375,20 @@ func extractOne(path string, o *options) error {
 		warnf("no textures in this package")
 		return nil
 	}
+	p, adjusting := o.params()
+	var rec *recolor.Params
+	suffix := ""
+	if adjusting {
+		rec = &p
+		suffix = recolorSuffix(p)
+	}
 	rep, err := info.Export(l2tx.ExportOptions{
 		OutDir:    o.outDir,
 		WritePNG:  o.writePNG || !o.writeDDS,
 		WriteDDS:  o.writeDDS,
 		Overwrite: o.overwrite,
+		Recolor:   rec,
+		DirSuffix: suffix,
 	})
 	if err != nil {
 		return err
@@ -256,6 +402,12 @@ func extractOne(path string, o *options) error {
 			len(rep.Skipped), plural(len(rep.Skipped), "", "s"))
 	}
 	okf("extracted %d texture%s to %s", len(rep.Written), plural(len(rep.Written), "", "s"), dim(relPathTo(rep.OutDir)))
+	if adjusting {
+		okf("recoloured %d texture%s (%s)", rep.Recolored, plural(rep.Recolored, "", "s"), p.Describe())
+		if len(rep.NormalMaps) > 0 {
+			warnf("%d normal map%s left unchanged", len(rep.NormalMaps), plural(len(rep.NormalMaps), "", "s"))
+		}
+	}
 	return nil
 }
 
@@ -501,6 +653,162 @@ func cmdList(o *options) int {
 	return code
 }
 
+// cmdApply recolours a package without going through image files.
+func cmdApply(o *options) int {
+	p, ok := o.params()
+	if !ok {
+		errorf("-apply needs -hue, -sat or -light")
+		return 2
+	}
+	if len(o.utx) != 1 {
+		errorf("-apply needs exactly one .utx file")
+		return 2
+	}
+	pkg := o.utx[0]
+	info, err := l2tx.Load(pkg)
+	if err != nil {
+		errorf("%v", err)
+		return 1
+	}
+	title("%s  %s", filepath.Base(pkg), dim(versionText(info)))
+	rep, err := info.ApplyRecolor(p)
+	if err != nil {
+		errorf("%v", err)
+		return 1
+	}
+	for _, s := range rep.Skipped {
+		warnf("%s", s)
+	}
+	if rep.Changed == 0 {
+		errorf("nothing was recoloured")
+		return 1
+	}
+
+	outPath := pkg
+	backup := !o.noBackup
+	if o.outDir != "" {
+		outPath = o.outDir
+		if !samePath(outPath, pkg) {
+			backup = false
+			if st, err := os.Stat(outPath); err == nil {
+				if st.IsDir() {
+					errorf("%s is a folder; -o needs a file name with -apply", outPath)
+					return 2
+				}
+				if !o.overwrite {
+					errorf("%s already exists (use -y to overwrite)", outPath)
+					return 1
+				}
+			}
+		}
+	}
+	out, err := info.Save(outPath, backup)
+	if err != nil {
+		errorf("%v", err)
+		return 1
+	}
+	okf("recoloured %d texture%s (%s)", rep.Changed, plural(rep.Changed, "", "s"), p.Describe())
+	okf("saved %s", dim(filepath.Base(out)))
+	return 0
+}
+
+// cmdRecolor recolours the PNGs of an exported folder.
+func cmdRecolor(o *options) int {
+	p, ok := o.params()
+	if !ok {
+		errorf("-recolor needs -hue, -sat or -light")
+		return 2
+	}
+	in := o.recolorDir
+	out := o.outDir
+	if out == "" {
+		out = defaultRecolorDir(in, p)
+	}
+	title("%s  %s", filepath.Base(in), dim(p.Describe()))
+	rep, err := l2tx.RecolorFolder(in, l2tx.RecolorOptions{
+		OutDir:    out,
+		Params:    p,
+		Overwrite: o.overwrite,
+	})
+	if err != nil {
+		errorf("%v", err)
+		return 1
+	}
+	for _, f := range rep.Failed {
+		warnf("%s", f)
+	}
+	for _, n := range rep.NormalMaps {
+		warnf("%s: normal map left unchanged", n)
+	}
+	if len(rep.Skipped) > 0 {
+		warnf("%d file%s already exist in the output folder (use -y to overwrite)",
+			len(rep.Skipped), plural(len(rep.Skipped), "", "s"))
+	}
+	if len(rep.Written) == 0 {
+		if len(rep.Failed) == 0 && len(rep.Skipped) == 0 {
+			errorf("nothing was recoloured")
+			return 1
+		}
+	} else {
+		okf("recoloured %d image%s -> %s", len(rep.Written), plural(len(rep.Written), "", "s"), dim(relPathTo(rep.OutDir)))
+	}
+	if rep.Manifest {
+		okf("manifest written - drop the folder to import it")
+	} else {
+		warnf("no %s in the source folder; the output cannot be imported on its own", l2tx.ManifestName)
+	}
+	if len(rep.Failed) > 0 {
+		return 1
+	}
+	return 0
+}
+
+// recolorSuffix builds a short folder-name suffix such as "hue120-sat80".
+func recolorSuffix(p recolor.Params) string {
+	var parts []string
+	if h := math.Round(p.Hue*10) / 10; h != 0 {
+		parts = append(parts, fmt.Sprintf("hue%g", h))
+	}
+	if s := math.Round(p.Saturation*1000) / 10; s != 100 {
+		parts = append(parts, fmt.Sprintf("sat%g", s))
+	}
+	if l := math.Round(p.Lightness*1000) / 10; l != 100 {
+		parts = append(parts, fmt.Sprintf("light%g", l))
+	}
+	if p.Mode == recolor.ModeHSL {
+		parts = append(parts, "hsl")
+	}
+	if len(parts) == 0 {
+		return "recolored"
+	}
+	return strings.Join(parts, "-")
+}
+
+// defaultRecolorDir puts a recoloured copy next to the source folder:
+// IntactL.textures -> IntactL.hue120.textures.
+func defaultRecolorDir(dir string, p recolor.Params) string {
+	if a, err := filepath.Abs(dir); err == nil {
+		dir = a
+	}
+	parent := filepath.Dir(dir)
+	base := filepath.Base(dir)
+	suffix := recolorSuffix(p)
+	const ext = ".textures"
+	if strings.HasSuffix(strings.ToLower(base), ext) {
+		return filepath.Join(parent, base[:len(base)-len(ext)]+"."+suffix+ext)
+	}
+	return filepath.Join(parent, base+"."+suffix)
+}
+
+func samePath(a, b string) bool {
+	aa, err1 := filepath.Abs(a)
+	bb, err2 := filepath.Abs(b)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
+}
+
 // --- console helpers -------------------------------------------------------
 
 func color(code, s string) string {
@@ -581,7 +889,7 @@ func usage() {
 	fmt.Println()
 	fmt.Println(bold("Options:"))
 	fmt.Println("   -list file.utx           list textures without extracting")
-	fmt.Println("   -o DIR                   extraction folder")
+	fmt.Println("   -o DIR|FILE              extraction folder, -recolor output folder, or -apply output .utx")
 	fmt.Println("   -png | -dds | -both      image format (default -png; -dds is lossless)")
 	fmt.Println("   -i file.utx img...       import images into a package")
 	fmt.Println("   -format dxt1|dxt3|dxt5|rgba8   force the stored format on import")
@@ -589,6 +897,18 @@ func usage() {
 	fmt.Println("   -nobackup                do not create <file>.utx.bak")
 	fmt.Println("   -q                       quiet")
 	fmt.Println("   -nopause                 do not wait for Enter when run by drag & drop")
+	fmt.Println()
+	fmt.Println(bold("Recolouring:"))
+	fmt.Println("   -hue DEG                 rotate hue (for example 120, -45, 180)")
+	fmt.Println("   -sat PCT                 saturation scale (100 = unchanged)")
+	fmt.Println("   -light PCT               lightness scale (100 = unchanged)")
+	fmt.Println("   -mode oklch|hsl          colour model (default oklch; hsl matches Photoshop)")
+	fmt.Println("   -recolor                 recolour the PNGs of an exported folder")
+	fmt.Println("   -apply                   recolour a package in place (or write -o file.utx)")
+	fmt.Println()
+	fmt.Println("   l2utx -hue 120 file.utx          extract to file.hue120.textures\\ already recoloured")
+	fmt.Println("   l2utx -hue 120 -recolor folder   write folder.hue120.textures\\ from an existing export")
+	fmt.Println("   l2utx -hue 120 -apply file.utx   rewrite the package (file.utx.bak is kept)")
 	fmt.Println()
 	fmt.Println(bold("How importing works:"))
 	fmt.Println("   The name of the image selects the texture object: armor_t1004_b_i00.png")

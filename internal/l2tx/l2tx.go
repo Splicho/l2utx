@@ -14,6 +14,7 @@ import (
 
 	"l2utx/internal/dxt"
 	"l2utx/internal/imgio"
+	"l2utx/internal/recolor"
 	"l2utx/internal/upkg"
 )
 
@@ -100,28 +101,42 @@ func (i *Info) TextureIndex(name string) int {
 
 // ExportOptions controls extraction.
 type ExportOptions struct {
-	OutDir   string
-	WritePNG bool
-	WriteDDS bool
-	Only     []string
+	OutDir    string
+	WritePNG  bool
+	WriteDDS  bool
+	Only      []string
 	Overwrite bool
-	Quiet    bool
+	Quiet     bool
+	// Recolor is applied to decoded pixels before they are written. Normal maps
+	// (DXT5N) are never recoloured because rotating their hue would corrupt the
+	// encoded normals.
+	Recolor *recolor.Params
+	// DirSuffix is appended to the default extraction folder name, e.g.
+	// "hue120" turns Pkg.textures into Pkg.hue120.textures.
+	DirSuffix string
 }
 
 // ExportReport summarises an extraction run.
 type ExportReport struct {
-	OutDir   string
-	Written  []string
-	Skipped  []string
-	Failed   []string
-	Textures int
+	OutDir    string
+	Written   []string
+	Skipped   []string
+	Failed    []string
+	Textures  int
+	Recolored int
+	// NormalMaps lists DXT5N textures that were written unchanged.
+	NormalMaps []string
 }
 
 // Export writes texture images next to (or into) OutDir.
 func (i *Info) Export(opts ExportOptions) (*ExportReport, error) {
 	outDir := opts.OutDir
 	if outDir == "" {
-		outDir = filepath.Join(i.Dir, i.Base+".textures")
+		name := i.Base + ".textures"
+		if opts.DirSuffix != "" {
+			name = i.Base + "." + opts.DirSuffix + ".textures"
+		}
+		outDir = filepath.Join(i.Dir, name)
 	}
 	outDir = absPath(outDir)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -166,10 +181,23 @@ func (i *Info) Export(opts ExportOptions) (*ExportReport, error) {
 			Height: tex.Mips[0].VSize,
 			Mips:   len(tex.Mips),
 		}
+		if opts.Recolor != nil && !opts.Recolor.IsIdentity() && tex.Format == upkg.FmtDXT5N {
+			// Hue-rotating a normal map would corrupt its encoded normal. Leave
+			// it out of the recoloured folder entirely: importing the folder
+			// then leaves the original normal map in the package untouched.
+			rep.NormalMaps = append(rep.NormalMaps, te.Name)
+			continue
+		}
 		img, err := DecodeTexture(tex)
 		if err != nil {
 			rep.Failed = append(rep.Failed, fmt.Sprintf("%s: %v", te.Name, err))
 			continue
+		}
+		recolored := false
+		if opts.Recolor != nil && !opts.Recolor.IsIdentity() {
+			recolor.Apply(img, *opts.Recolor)
+			recolored = true
+			rep.Recolored++
 		}
 		// Lineage 2 packages may contain several exports with the same name;
 		// suffix them so each one keeps its own file and can be edited alone.
@@ -199,6 +227,13 @@ func (i *Info) Export(opts ExportOptions) (*ExportReport, error) {
 			entry.DDS = name
 			if fileExists(path) && !opts.Overwrite {
 				rep.Skipped = append(rep.Skipped, name)
+			} else if recolored {
+				err = WriteImageDDS(path, tex.Format, img, len(tex.Mips))
+				if err != nil {
+					rep.Failed = append(rep.Failed, fmt.Sprintf("%s: %v", te.Name, err))
+					continue
+				}
+				rep.Written = append(rep.Written, name)
 			} else if err := WriteTextureDDS(path, tex); err != nil {
 				rep.Failed = append(rep.Failed, fmt.Sprintf("%s: %v", te.Name, err))
 				continue
@@ -343,6 +378,53 @@ func WriteTextureDDS(path string, t *upkg.Texture) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// WriteImageDDS writes a re-encoded DDS from recoloured pixels, using the
+// texture's format when possible. Unlike WriteTextureDDS this cannot preserve
+// the original compressed blocks; it is used when the pixels have changed.
+// mipCount keeps the package's mip count; values below 1 mean a full chain.
+func WriteImageDDS(path string, format int, img *dxt.Image, mipCount int) error {
+	if img == nil || img.W <= 0 || img.H <= 0 {
+		return errors.New("cannot write an empty image")
+	}
+	if format == upkg.FmtDXT5N {
+		return errors.New("refusing to re-encode a normal map")
+	}
+	levels := dxt.GenerateMips(img)
+	if mipCount > 0 && mipCount < len(levels) {
+		levels = levels[:mipCount]
+	}
+	mips := make([][]byte, 0, len(levels))
+	var pf imgio.PixelFormat
+	switch format {
+	case upkg.FmtDXT1:
+		pf = imgio.PixelDXT1
+		for _, lvl := range levels {
+			mips = append(mips, dxt.EncodeDXT1(lvl))
+		}
+	case upkg.FmtDXT3:
+		pf = imgio.PixelDXT3
+		for _, lvl := range levels {
+			mips = append(mips, dxt.EncodeDXT3(lvl))
+		}
+	case upkg.FmtDXT5:
+		pf = imgio.PixelDXT5
+		for _, lvl := range levels {
+			mips = append(mips, dxt.EncodeDXT5(lvl))
+		}
+	default:
+		pf = imgio.PixelRGBA8
+		for _, lvl := range levels {
+			raw := make([]byte, 0, lvl.W*lvl.H*4)
+			for _, c := range lvl.Pix {
+				raw = append(raw, c.R, c.G, c.B, c.A)
+			}
+			mips = append(mips, raw)
+		}
+	}
+	data := imgio.EncodeDDS(pf, img.W, img.H, mips)
+	return os.WriteFile(path, data, 0o644)
+}
+
 // ImportOptions controls import behaviour.
 type ImportOptions struct {
 	OutPath     string // where to write ("" = in place)
@@ -353,8 +435,8 @@ type ImportOptions struct {
 
 // ImportResult reports what a single image did.
 type ImportResult struct {
-	Image    string
-	Object   string
+	Image      string
+	Object     string
 	OldW, OldH int
 	NewW, NewH int
 	OldFormat  string
@@ -582,7 +664,7 @@ func EncodeMips(levels []*dxt.Image, format int) ([]upkg.Mip, error) {
 		out = append(out, upkg.Mip{
 			USize: img.W, VSize: img.H,
 			UBits: byte(upkg.Log2(img.W)), VBits: byte(upkg.Log2(img.H)),
-			Data:  data,
+			Data: data,
 		})
 	}
 	return out, nil

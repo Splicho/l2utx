@@ -1,8 +1,8 @@
 # l2utx — Lineage 2 / Unreal Engine 2 texture import & export
 
 A single-file Windows tool that opens Lineage 2 `.utx` texture packages, exports
-every texture to an editable image, and writes edited images back into the
-package.
+every texture to an editable image, recolours whole packages or export folders,
+and writes edited images back into the package.
 
 Everything is implemented from scratch in Go (no DLLs, no UnrealEd, no external
 tools), including the Unreal Engine 2 package format, the DXT1/DXT3/DXT5 codecs
@@ -35,6 +35,17 @@ one command — see [Building](#building).
 That is the whole workflow. `-dds` can be used instead of PNG when byte-exact,
 loss-free round-tripping matters (see below).
 
+To recolour a package without opening Photoshop, pass `-hue`:
+
+```
+l2utx -hue 120 file.utx
+```
+
+This extracts as usual, but the PNGs are written with their hue rotated by 120°
+(and into `file.hue120.textures\` so the original export is not overwritten).
+Drop that folder back onto the exe to import it. See
+[Recolouring textures](#recolouring-textures) for the other two modes.
+
 ---
 
 ## Commands
@@ -50,19 +61,96 @@ loss-free round-tripping matters (see below).
 
 ```
 -list file.utx              list the textures (name, format, size, mip count)
--o DIR                      extraction folder
+-o DIR|FILE                 extraction folder, -recolor output folder, or -apply output package
 -png | -dds | -both         image format to write (default -png)
 -i file.utx img...          import images into a specific package
 -format dxt1|dxt3|dxt5|rgba8  force the stored pixel format on import
 -nomips                     store only the base mip level on import
+-hue DEG                    rotate hue (export, -recolor and -apply)
+-sat PCT                    saturation scale, 100 = unchanged
+-light PCT                  lightness scale, 100 = unchanged
+-mode oklch|hsl             colour model for -hue (default oklch)
+-recolor                    recolour the PNGs of an exported folder
+-apply                      recolour a package in place
 -nobackup                   do not create <file>.utx.bak
--y                          overwrite existing files when extracting
+-y                          overwrite existing files when extracting/recolouring
 -q                          quiet
 -nopause                    do not wait for Enter when started by drag & drop
 -h                          help
 ```
 
 Exit codes: `0` success, `1` failure, `2` bad arguments.
+
+---
+
+## Recolouring textures
+
+Hue, saturation and lightness changes are built into the tool. There is no
+Photoshop batch step, no action file and no external image library.
+
+### Recolour while extracting
+
+```
+l2utx -hue 120 file.utx
+```
+
+Extracts to `file.hue120.textures\` with every PNG already rotated. The original
+`file.textures\` is left alone, so you can generate another variant with a
+different hue. Drop the new folder onto the exe to import it.
+
+### Recolour an existing export
+
+```
+l2utx -hue 120 -recolor file.textures
+```
+
+Reads the PNGs in `file.textures\`, writes the recoloured copies to
+`file.hue120.textures\` and updates the manifest for the new location. The source
+folder is never modified. `-o DIR` chooses a different output folder; `-y`
+allows overwriting a previous run.
+
+### Recolour the package directly
+
+```
+l2utx -hue 120 -apply file.utx
+```
+
+Decodes, rotates and re-encodes every texture in the package and keeps the
+original as `file.utx.bak`. To write a new package instead:
+
+```
+l2utx -hue 120 -apply -o file_red.utx file.utx
+```
+
+The input package is not touched when `-o` is used.
+
+### Controls and colour model
+
+* `-hue DEG` rotates the hue. 120° is a third of the colour wheel; negative
+  values rotate the other way.
+* `-sat PCT` scales saturation (`-sat 0` makes a greyscale version).
+* `-light PCT` scales lightness.
+* `-mode oklch` (default) rotates hue in OKLCH, which keeps the perceived
+  brightness of each pixel. This looks natural on dark armour and icons and
+  avoids the saturated colours HSL can produce.
+* `-mode hsl` uses the same HSL maths as Photoshop's Hue/Saturation, for when
+  you want to match an existing action.
+
+The alpha channel is copied through unchanged. Perfectly neutral pixels (black,
+white, grey metal) have no hue and stay exactly as they are.
+
+Normal-map textures (`DXT5N`) are skipped automatically: rotating their colour
+channels would corrupt the encoded normals. They are also left out of recoloured
+folders, so dropping such a folder back onto the exe leaves the original normal
+maps in the package untouched. In `-recolor` and `-apply`, formats that cannot
+be re-encoded without changing the asset (P8/L8/RGB16) are reported and left
+alone. DXT1, DXT3, DXT5 and RGBA8 are re-encoded.
+
+Because the rotation applies to every coloured pixel, a texture that mixes skin
+with clothing will rotate the skin too. To keep skin or other details, recolour
+only the files you want, or make a variant folder and remove the unwanted PNGs
+before dropping it. A hue-range selector would be the natural next step if that
+is not enough.
 
 ---
 
@@ -95,10 +183,12 @@ PNG, JPEG, GIF, BMP, TGA and DDS input; PNG and DDS output.
 
 `-dds` writes the original compressed blocks (plus the full mip chain) into a
 standard DDS, so re-importing an unchanged DDS reproduces the source package
-**byte for byte**. Edited DDS files are re-encoded, and PNG/TGA/BMP/JPEG are
-always re-encoded with a quality-optimising DXT encoder (PCA/box endpoint
-search per 4×4 block, explicit 4-bit alpha for DXT3, interpolated alpha for
-DXT5, box-filtered mip chain).
+**byte for byte**. When `-hue` is active the DDS has to be re-encoded from the
+rotated pixels (a colour change cannot be applied to the compressed blocks), so
+that lossless property only holds for plain `-dds` exports. Edited DDS files are
+re-encoded, and PNG/TGA/BMP/JPEG are always re-encoded with a quality-optimising
+DXT encoder (PCA/box endpoint search per 4×4 block, explicit 4-bit alpha for
+DXT3, interpolated alpha for DXT5, box-filtered mip chain).
 
 Re-encoding an unchanged extracted PNG back into a package measures ~37 dB
 PSNR (mean over the 98 textures of `IntactL.utx`), which is a double DXT3 pass.
@@ -132,6 +222,9 @@ happened. Texture dimensions may otherwise be changed freely.
   remaining ones are exotic subclasses in other games' packages.
 * Re-encoding 98 textures of `IntactL.utx` yields 37.0 dB mean PSNR
   (34.6 dB worst) against the source images.
+* Exporting all five sample packages with `-hue 90` and importing the recoloured
+  folders back decodes and validates again, including `IntactH.utx` with its
+  duplicate object names. Alpha and neutral pixels are unchanged (unit tests).
 
 ## Known limitations
 
@@ -145,6 +238,11 @@ happened. Texture dimensions may otherwise be changed freely.
 * `P8`/`L8` textures are exported as greyscale without the palette.
 * New texture **objects** cannot be added, only existing ones replaced (the
   object name is the link between file and package).
+* Hue rotation is global per texture. Neutral pixels and alpha are preserved,
+  but skin, gold trim and other coloured details rotate together with the part
+  you want to change; there is no colour-range mask yet.
+* `-hue` on a DDS output and `-apply` re-encode the affected textures, so they
+  cost one DXT generation of quality (the same cost as a normal PNG import).
 
 ## Building
 
@@ -168,7 +266,8 @@ internal/upkg/                UE2 package reader/writer
   texture.go                  UTexture payload + mip chain
 internal/dxt/                 DXT1/3/5 decode + encode, mip generation
 internal/imgio/               PNG/JPEG/GIF/BMP/TGA/DDS input, PNG/DDS output
-internal/l2tx/                export/import orchestration + manifest
+internal/recolor/             hue/saturation/lightness (OKLCH and HSL)
+internal/l2tx/                export/import/recolour orchestration + manifest
 internal/win/                 console helpers (ANSI, pause-on-drag&drop)
 tools/pkg.py                  independent Python reader used to cross-check
 tools/survey/                 stress test over a folder of real packages
